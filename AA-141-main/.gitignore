@@ -1,0 +1,35 @@
+# Віртуальне середовище
+venv/
+env/
+ENV/
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Змінні середовища
+.env
+.venv
+
+# Діалоги (за потреби видаліть цей рядок, якщо хочете зберігати діалоги в git)
+dialogues/
+summaries/
+
+# База даних embeddings
+embeddings_db/
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
