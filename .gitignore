@@ -33,3 +33,8 @@ embeddings_db/
 .DS_Store
 Thumbs.db
 
+voice_id_db.json
+faces_memory.json
+robot_memory.json
+
+tmp_model/
