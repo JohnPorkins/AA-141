@@ -11,8 +11,7 @@ from openai import OpenAI
 from dotenv import load_dotenv, find_dotenv
 from pydantic import BaseModel
 
-from pynput import keyboard
-from openai_realtime_client import RealtimeClient, AudioHandler, InputHandler, TurnDetectionMode
+from openai_realtime_client import RealtimeClient, AudioHandler, TurnDetectionMode
 from llama_index.core.tools import FunctionTool
 
 # Import existing functionality from chat.py
@@ -665,8 +664,6 @@ async def main():
     conversation_manager.initialize(openai_client, db_path)
 
     audio_handler = AudioHandler()
-    input_handler = InputHandler()
-    input_handler.loop = asyncio.get_running_loop()
 
     # State tracking for interruptions
     current_question = ""
@@ -753,10 +750,10 @@ async def main():
         
         if is_responding:
             interruption_count += 1
-            # Schedule the response handling using the event loop
-            loop = input_handler.loop
-            if loop and loop.is_running():
-                asyncio.run_coroutine_threadsafe(handle_interrupt_response(), loop)
+            # Schedule the response handling using the current event loop
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                asyncio.create_task(handle_interrupt_response())
 
     def on_input_transcript(transcript):
         global current_question, current_answer, interruption_count, is_responding, answer_started
@@ -791,10 +788,6 @@ async def main():
         tools=tools,
     )
 
-    # Start keyboard listener in separate thread
-    listener = keyboard.Listener(on_press=input_handler.on_press)
-    listener.start()
-
     try:
         try:
             await realtime_client.connect()
@@ -825,18 +818,14 @@ async def main():
 
         print("Connected to OpenAI Realtime API!")
         print("Audio streaming will start automatically.")
-        print("Press 'q' to quit")
+        print("Use Ctrl+C or your service manager to stop the app.")
         print("")
 
         # Start continuous audio streaming
         streaming_task = asyncio.create_task(audio_handler.start_streaming(realtime_client))
 
-        # Simple input loop for quit command
-        while True:
-            command, _ = await input_handler.command_queue.get()
-
-            if command == 'q':
-                break
+        # Run until one of the tasks finishes or the process is interrupted
+        await asyncio.gather(message_handler, streaming_task)
 
     except Exception as e:
         print(f"Error: {e}")

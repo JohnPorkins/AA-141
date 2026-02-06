@@ -17,7 +17,6 @@ openai-realtime-client @ git+https://github.com/run-llama/openai_realtime_client
 
 # Indexing and input
 llama-index>=0.10.0
-pynput>=1.7.6
 
 opencv-python>=4.11
 Flask==2.2.2
