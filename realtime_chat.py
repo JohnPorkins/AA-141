@@ -536,6 +536,13 @@ embeddings_db_folder = Path("embeddings_db")
 db_path = None
 openai_client = None
 
+# Global state tracking for interruptions
+current_question = ""
+current_answer = ""
+interruption_count = 0
+is_responding = False
+answer_started = False
+
 class ConversationManager:
     def __init__(self):
         self.messages = []
@@ -664,13 +671,6 @@ async def main():
     conversation_manager.initialize(openai_client, db_path)
 
     audio_handler = AudioHandler()
-
-    # State tracking for interruptions
-    current_question = ""
-    current_answer = ""
-    interruption_count = 0
-    is_responding = False
-    answer_started = False
 
     def on_text_delta(text):
         global current_answer, is_responding, answer_started
