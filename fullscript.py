@@ -4,6 +4,8 @@ import sys
 import json
 import sqlite3
 import math
+import time
+import threading
 from array import array
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +15,335 @@ from pydantic import BaseModel
 
 from openai_realtime_client import RealtimeClient, AudioHandler, TurnDetectionMode
 from llama_index.core.tools import FunctionTool
+
+import numpy as np
+import cv2
+from flask import Flask, Response
+
+import torch
+import torchaudio
+if not hasattr(torchaudio, 'list_audio_backends'):
+    torchaudio.list_audio_backends = lambda: ['soundfile']
+if not hasattr(torchaudio, 'get_audio_backend'):
+    torchaudio.get_audio_backend = lambda: 'soundfile'
+
+import torchaudio.transforms as T
+import sounddevice as sd
+from speechbrain.inference.speaker import SpeakerRecognition
+from insightface.app import FaceAnalysis
+import mediapipe as mp
+
+# --- Group ID / robot memory settings ---
+ROBOT_MEMORY_FILE = "robot_memory.json"
+FACE_SIM_THRESHOLD = 0.45
+VOICE_SIM_THRESHOLD = 0.30
+WAKE_UP_THRESHOLD = 0.3
+SLEEP_TIMEOUT = 15
+NN_SKIP_FRAMES = 15
+
+outputFrame = None
+frame_lock = threading.Lock()
+group_app = Flask(__name__)
+
+robot_state = {
+    "status": "BOOTING...",
+    "subtext": "Loading Group Logic...",
+    "color": (255, 255, 255),
+    "mode": "SLEEP"
+}
+
+# Group ID models (inited when starting group logic)
+NATIVE_RATE = 44100
+resampler = None
+vad_model = None
+speaker_model = None
+face_app = None
+hands_detector = None
+_group_models_loaded = False
+
+def init_group_models():
+    """Load face/voice/hand models for Group ID (ultv1)."""
+    global NATIVE_RATE, resampler, vad_model, speaker_model, face_app, hands_detector, _group_models_loaded
+    if _group_models_loaded:
+        return
+    print(">>> [INIT] Загрузка моделей Group ID...")
+    try:
+        dev_info = sd.query_devices(kind='input')
+        NATIVE_RATE = int(dev_info['default_samplerate'])
+    except Exception:
+        NATIVE_RATE = 44100
+    resampler = T.Resample(NATIVE_RATE, 16000)
+    vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', trust_repo=True)
+    speaker_model = SpeakerRecognition.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp_model")
+    face_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
+    face_app.prepare(ctx_id=-1, det_size=(320, 320))
+    hands_detector = mp.solutions.hands.Hands(max_num_hands=1, min_detection_confidence=0.5)
+    _group_models_loaded = True
+    print(">>> [INIT] Group ID модели загружены.")
+
+def load_robot_db():
+    if os.path.exists(ROBOT_MEMORY_FILE):
+        try:
+            with open(ROBOT_MEMORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_robot_db(db):
+    with open(ROBOT_MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False)
+
+def get_next_robot_id():
+    db = load_robot_db()
+    return f"User_{len(db) + 1:05d}"
+
+def convert_audio(audio_np):
+    waveform = torch.from_numpy(audio_np).float()
+    if len(waveform.shape) == 1:
+        waveform = waveform.unsqueeze(0)
+    elif waveform.shape[0] != 1:
+        waveform = waveform.t()
+    return resampler(waveform)
+
+def get_voice_embedding(audio_data):
+    wav_16k = convert_audio(audio_data)
+    emb = speaker_model.encode_batch(wav_16k)
+    return (emb.squeeze().cpu().numpy() / np.linalg.norm(emb.squeeze().cpu().numpy())).tolist()
+
+def is_silence(audio_chunk):
+    wav_16k = convert_audio(audio_chunk)
+    target = 512
+    if wav_16k.shape[-1] > target:
+        wav_16k = wav_16k[..., :target]
+    elif wav_16k.shape[-1] < target:
+        wav_16k = torch.nn.functional.pad(wav_16k, (0, target - wav_16k.shape[-1]))
+    with torch.no_grad():
+        conf = vad_model(wav_16k, 16000).item()
+    return conf < WAKE_UP_THRESHOLD
+
+def identify_person_visual(face_emb):
+    db = load_robot_db()
+    best_id = "Unknown"
+    max_score = 0
+    for uid, data in db.items():
+        score = np.dot(face_emb, np.array(data["face_vec"]))
+        if score > max_score:
+            max_score = score
+            best_id = uid
+    return best_id, max_score
+
+def find_speaker_in_group(voice_emb, visible_users):
+    db = load_robot_db()
+    best_speaker_id = None
+    max_score = 0
+    for user in visible_users:
+        uid = user['id']
+        if uid == "Unknown":
+            continue
+        user_data = db.get(uid)
+        if user_data and user_data.get('voice_vec'):
+            saved_voice = np.array(user_data['voice_vec'])
+            score = np.dot(voice_emb, saved_voice)
+            if score > max_score:
+                max_score = score
+                best_speaker_id = uid
+    if max_score > VOICE_SIM_THRESHOLD:
+        return best_speaker_id, max_score
+    return None, 0.0
+
+def is_waving(frame):
+    try:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = hands_detector.process(rgb)
+        if res.multi_hand_landmarks:
+            lms = res.multi_hand_landmarks[0].landmark
+            return lms[8].y < lms[0].y
+    except Exception:
+        pass
+    return False
+
+def run_registration():
+    global robot_state
+    robot_state["status"] = "REGISTRATION"
+    robot_state["subtext"] = "Freeze..."
+    robot_state["color"] = (255, 0, 255)
+    time.sleep(1.0)
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(1)
+    cap.set(3, 320)
+    cap.set(4, 240)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        return
+    faces = face_app.get(frame)
+    if not faces:
+        robot_state["subtext"] = "No Face!"
+        time.sleep(1)
+        return
+    face_emb = faces[0].normed_embedding.tolist()
+    new_id = get_next_robot_id()
+    robot_state["subtext"] = f"SPEAK! ({new_id})"
+    try:
+        rec_voice = sd.rec(int(4 * NATIVE_RATE), samplerate=NATIVE_RATE, channels=1, blocking=True)
+        voice_emb = get_voice_embedding(rec_voice)
+    except Exception:
+        return
+    db = load_robot_db()
+    db[new_id] = {"face_vec": face_emb, "voice_vec": voice_emb, "created_at": time.time()}
+    save_robot_db(db)
+    robot_state["status"] = "SAVED"
+    robot_state["subtext"] = new_id
+    robot_state["color"] = (0, 255, 0)
+    time.sleep(2)
+
+def logic_loop():
+    global outputFrame, robot_state
+    init_group_models()
+    ratio = NATIVE_RATE / 16000
+    block_size = int(np.ceil(512 * ratio))
+    robot_state["mode"] = "SLEEP"
+    last_activity = time.time()
+    cap = None
+    frame_counter = 0
+    cached_people = []
+    print(">>> [SYSTEM] Group Logic Active.")
+    while True:
+        if robot_state["mode"] == "SLEEP":
+            robot_state["status"] = "SLEEP MODE"
+            robot_state["subtext"] = "Silence..."
+            robot_state["color"] = (100, 100, 100)
+            if outputFrame is not None:
+                with frame_lock:
+                    outputFrame[:] = 0
+            try:
+                with sd.InputStream(samplerate=NATIVE_RATE, channels=1, dtype='float32', blocksize=block_size) as stream:
+                    while True:
+                        chunk, _ = stream.read(block_size)
+                        if not is_silence(chunk):
+                            print(">>> ЗВУК!")
+                            robot_state["mode"] = "AWAKE"
+                            last_activity = time.time()
+                            frame_counter = 0
+                            break
+            except Exception:
+                time.sleep(1)
+        elif robot_state["mode"] == "AWAKE":
+            if cap is None or not cap.isOpened():
+                cap = cv2.VideoCapture(0)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(1)
+                cap.set(3, 320)
+                cap.set(4, 240)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            frame_counter += 1
+            if frame_counter % NN_SKIP_FRAMES == 0:
+                faces = face_app.get(frame)
+                cached_people = []
+                if faces:
+                    visible_users = []
+                    for face in faces:
+                        fid, fscore = identify_person_visual(face.normed_embedding)
+                        if fscore < FACE_SIM_THRESHOLD:
+                            fid = "Unknown"
+                        visible_users.append({
+                            'id': fid,
+                            'face_emb': face.normed_embedding,
+                            'bbox': face.bbox.astype(int),
+                            'role': 'Listener'
+                        })
+                    has_known = any(u['id'] != 'Unknown' for u in visible_users)
+                    if has_known:
+                        cap.release()
+                        robot_state["subtext"] = "Listening..."
+                        try:
+                            check_sound = sd.rec(int(2 * NATIVE_RATE), samplerate=NATIVE_RATE, channels=1, blocking=True)
+                            if np.max(np.abs(check_sound)) > 0.05:
+                                v_emb = get_voice_embedding(check_sound)
+                                speaker_id, score = find_speaker_in_group(v_emb, visible_users)
+                                if speaker_id:
+                                    for user in visible_users:
+                                        if user['id'] == speaker_id:
+                                            user['role'] = 'SPEAKER'
+                                    print(f">>> ГОВОРИТ: {speaker_id} ({int(score*100)}%)")
+                                else:
+                                    print(">>> Голос чужой.")
+                        except Exception:
+                            pass
+                        cap = cv2.VideoCapture(0)
+                        if not cap.isOpened():
+                            cap = cv2.VideoCapture(1)
+                        cap.set(3, 320)
+                        cap.set(4, 240)
+                    for user in visible_users:
+                        if user['id'] == "Unknown":
+                            if is_waving(frame):
+                                if cap.isOpened():
+                                    cap.release()
+                                run_registration()
+                                robot_state["mode"] = "AWAKE"
+                                cached_people = []
+                                continue
+                    cached_people = visible_users
+            if cached_people:
+                last_activity = time.time()
+                for p in cached_people:
+                    bbox = p['bbox']
+                    role = p['role']
+                    uid = p['id']
+                    if role == 'SPEAKER':
+                        color = (0, 255, 0)
+                        text = f"SPEAKING: {uid}"
+                    elif uid == "Unknown":
+                        color = (0, 0, 255)
+                        text = "Unknown (Wave?)"
+                    else:
+                        color = (0, 255, 255)
+                        text = f"{uid} (Silent)"
+                    cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+                    cv2.putText(frame, text, (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                robot_state["status"] = "MONITORING"
+                robot_state["subtext"] = f"People: {len(cached_people)}"
+            else:
+                robot_state["status"] = "SEARCHING"
+                robot_state["subtext"] = "..."
+            if time.time() - last_activity > SLEEP_TIMEOUT:
+                if cap and cap.isOpened():
+                    cap.release()
+                robot_state["mode"] = "SLEEP"
+                continue
+            cv2.rectangle(frame, (0, 0), (320, 30), (0, 0, 0), -1)
+            cv2.putText(frame, robot_state["status"], (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, robot_state["color"], 1)
+            cv2.rectangle(frame, (0, 210), (320, 240), (0, 0, 0), -1)
+            cv2.putText(frame, robot_state["subtext"], (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            with frame_lock:
+                outputFrame = frame.copy()
+
+def run_flask_group_id():
+    group_app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+
+@group_app.route("/")
+def group_index():
+    return '<html><body style="background:#000;color:#0f0;text-align:center;"><h1>GROUP ID</h1><img src="/video_feed" style="width:100%;max-width:640px;border:2px solid #333;"></body></html>'
+
+def gen_frames():
+    global outputFrame
+    while True:
+        with frame_lock:
+            if outputFrame is None:
+                pass
+            else:
+                (flag, enc) = cv2.imencode(".jpg", outputFrame)
+                yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(enc) + b'\r\n')
+        time.sleep(0.05)
+
+@group_app.route("/video_feed")
+def video_feed():
+    return Response(gen_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 # Import existing functionality from chat.py
 def init_embeddings_db(folder: Path) -> str:
@@ -669,6 +1000,11 @@ async def main():
 
     # Initialize conversation manager
     conversation_manager.initialize(openai_client, db_path)
+
+    # Start Group ID (ultv1): logic loop + Flask video feed on port 5000
+    threading.Thread(target=logic_loop, daemon=True).start()
+    threading.Thread(target=run_flask_group_id, daemon=True).start()
+    print("Group ID: http://0.0.0.0:5000/ (video feed)")
 
     audio_handler = AudioHandler()
 
