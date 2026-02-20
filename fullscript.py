@@ -156,12 +156,17 @@ def find_speaker_in_group(voice_emb, visible_users):
     return None, 0.0
 
 def is_waving(frame):
+    """Проверяет, машет ли человек любой рукой (левой или правой)"""
     try:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = hands_detector.process(rgb)
         if res.multi_hand_landmarks:
-            lms = res.multi_hand_landmarks[0].landmark
-            return lms[8].y < lms[0].y
+            # Проверяем все обнаруженные руки
+            for hand_landmarks in res.multi_hand_landmarks:
+                lms = hand_landmarks.landmark
+                # Проверяем махание: кончик указательного пальца выше запястья
+                if lms[8].y < lms[0].y:
+                    return True
     except Exception:
         pass
     return False
@@ -254,8 +259,13 @@ def logic_loop():
                 faces = face_app.get(frame)
                 cached_people = []
                 if faces:
+                    # Проверяем махание рукой ПЕРЕД обработкой лиц
+                    waving_detected = is_waving(frame)
+                    
                     visible_users = []
                     for face in faces:
+                        # Показываем лица, но НЕ записываем их автоматически
+                        # Проверяем только для отображения, не сохраняем в базу
                         fid, fscore = identify_person_visual(face.normed_embedding)
                         if fscore < FACE_SIM_THRESHOLD:
                             fid = "Unknown"
@@ -265,6 +275,17 @@ def logic_loop():
                             'bbox': face.bbox.astype(int),
                             'role': 'Listener'
                         })
+                    
+                    # Если человек машет рукой - запускаем регистрацию
+                    if waving_detected:
+                        print(">>> Обнаружено махание рукой! Запуск регистрации...")
+                        if cap.isOpened():
+                            cap.release()
+                        run_registration()
+                        robot_state["mode"] = "AWAKE"
+                        cached_people = []
+                        continue
+                    
                     has_known = any(u['id'] != 'Unknown' for u in visible_users)
                     if has_known:
                         cap.release()
@@ -288,15 +309,6 @@ def logic_loop():
                             cap = cv2.VideoCapture(1)
                         cap.set(3, 320)
                         cap.set(4, 240)
-                    for user in visible_users:
-                        if user['id'] == "Unknown":
-                            if is_waving(frame):
-                                if cap.isOpened():
-                                    cap.release()
-                                run_registration()
-                                robot_state["mode"] = "AWAKE"
-                                cached_people = []
-                                continue
                     cached_people = visible_users
             if cached_people:
                 last_activity = time.time()
@@ -309,7 +321,7 @@ def logic_loop():
                         text = f"SPEAKING: {uid}"
                     elif uid == "Unknown":
                         color = (0, 0, 255)
-                        text = "Unknown (Wave?)"
+                        text = "Unknown (Wave to register)"
                     else:
                         color = (0, 255, 255)
                         text = f"{uid} (Silent)"
