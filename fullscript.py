@@ -33,6 +33,9 @@ from speechbrain.inference.speaker import SpeakerRecognition
 from insightface.app import FaceAnalysis
 import mediapipe as mp
 
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
 # --- Group ID / robot memory settings ---
 ROBOT_MEMORY_FILE = os.path.join("embeddings_db", "robotmemory")
 FACE_SIM_THRESHOLD = 0.45
@@ -215,15 +218,21 @@ def logic_loop():
             robot_state["status"] = "SLEEP MODE"
             robot_state["subtext"] = "Silence..."
             robot_state["color"] = (100, 100, 100)
+            # Закрываем камеру в режиме SLEEP
+            if cap is not None and cap.isOpened():
+                cap.release()
+                cap = None
+            # Очищаем кадр
             if outputFrame is not None:
                 with frame_lock:
-                    outputFrame[:] = 0
+                    outputFrame = None
+            # Только слушаем микрофон, не общаемся
             try:
                 with sd.InputStream(samplerate=NATIVE_RATE, channels=1, dtype='float32', blocksize=block_size) as stream:
-                    while True:
+                    while robot_state["mode"] == "SLEEP":
                         chunk, _ = stream.read(block_size)
                         if not is_silence(chunk):
-                            print(">>> ЗВУК!")
+                            print(">>> ЗВУК! Переход в режим AWAKE")
                             robot_state["mode"] = "AWAKE"
                             last_activity = time.time()
                             frame_counter = 0
@@ -316,6 +325,25 @@ def logic_loop():
                     cap.release()
                 robot_state["mode"] = "SLEEP"
                 continue
+            # Рисуем руки используя MediaPipe Hands
+            try:
+                if hands_detector is not None:
+                    frame.flags.writeable = False
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    hands_results = hands_detector.process(rgb_frame)
+                    frame.flags.writeable = True
+                    if hands_results.multi_hand_landmarks:
+                        for hand_landmarks in hands_results.multi_hand_landmarks:
+                            mp_drawing.draw_landmarks(
+                                frame,
+                                hand_landmarks,
+                                mp.solutions.hands.HAND_CONNECTIONS,
+                                mp_drawing_styles.get_default_hand_landmarks_style(),
+                                mp_drawing_styles.get_default_hand_connections_style(),
+                            )
+            except Exception:
+                pass
+            
             cv2.rectangle(frame, (0, 0), (320, 30), (0, 0, 0), -1)
             cv2.putText(frame, robot_state["status"], (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, robot_state["color"], 1)
             cv2.rectangle(frame, (0, 210), (320, 240), (0, 0, 0), -1)
@@ -1010,6 +1038,9 @@ async def main():
 
     def on_text_delta(text):
         global current_answer, is_responding, answer_started
+        # Обрабатываем ответы только в режиме AWAKE
+        if robot_state["mode"] != "AWAKE":
+            return
         print(f"Assistant: {text}", end="", flush=True)
         # Add to conversation when assistant speaks
         if text.strip():
@@ -1021,6 +1052,9 @@ async def main():
                 current_answer += text
 
     def on_audio_delta(audio):
+        # Воспроизводим аудио только в режиме AWAKE
+        if robot_state["mode"] != "AWAKE":
+            return
         print("Playing audio delta")
         audio_handler.play_audio(audio)
 
@@ -1093,6 +1127,10 @@ async def main():
 
     def on_input_transcript(transcript):
         global current_question, current_answer, interruption_count, is_responding, answer_started
+        # Обрабатываем транскрипты только в режиме AWAKE
+        if robot_state["mode"] != "AWAKE":
+            print(f"Ignoring transcript in SLEEP mode: {transcript}")
+            return
         print(f"Input transcript: {transcript}")
         # Reset state when new question comes in
         current_question = transcript
