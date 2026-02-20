@@ -34,7 +34,7 @@ from insightface.app import FaceAnalysis
 import mediapipe as mp
 
 # --- Group ID / robot memory settings ---
-ROBOT_MEMORY_FILE = "robot_memory.json"
+ROBOT_MEMORY_FILE = os.path.join("embeddings_db", "robotmemory")
 FACE_SIM_THRESHOLD = 0.45
 VOICE_SIM_THRESHOLD = 0.30
 WAKE_UP_THRESHOLD = 0.3
