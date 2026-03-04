@@ -207,9 +207,13 @@ def camera_thread():
                 
                 human_distance = smoothed_human_distance if smoothed_human_distance else 0
 
-                # Малюємо ЖОВТУ рамку (Пошук)
+                # Малюємо ЖОВТУ рамку (Пошук) + підпис з відстанню
                 cv2.rectangle(image, (bx, by), (bx+bw, by+bh), (0, 255, 255), 2)
-                cv2.putText(image, "SEARCHING...", (bx, by-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                if human_distance and human_distance > 0:
+                    label = f"SEARCH {human_distance} mm"
+                else:
+                    label = "SEARCHING..."
+                cv2.putText(image, label, (bx, by-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
                 # Логіка захоплення (Центр + 2 секунди)
                 if -10 <= angle_offset <= 10 and 400 < human_distance < 2000:
@@ -242,9 +246,13 @@ def camera_thread():
                     else: smoothed_human_distance = int(0.2 * raw_dist + 0.8 * smoothed_human_distance)
                 human_distance = smoothed_human_distance if smoothed_human_distance else 0
 
-                # Малюємо ЗЕЛЕНУ рамку (Залочено)
+                # Малюємо ЗЕЛЕНУ рамку (Залочено) + підпис з відстанню
                 cv2.rectangle(image, (bx, by), (bx+bw, by+bh), (0, 255, 0), 3)
-                cv2.putText(image, "LOCKED", (bx, by-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                if human_distance and human_distance > 0:
+                    label = f"LOCKED {human_distance} mm"
+                else:
+                    label = "LOCKED"
+                cv2.putText(image, label, (bx, by-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                 # 🧠 ЛОГІКА РУХУ
                 if human_distance > 100:
