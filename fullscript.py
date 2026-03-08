@@ -19,6 +19,12 @@ from llama_index.core.tools import FunctionTool
 import numpy as np
 import cv2
 from flask import Flask, Response
+import requests
+
+try:
+    import serial
+except ImportError:
+    serial = None
 
 import torch
 import torchaudio
@@ -384,6 +390,261 @@ def gen_frames():
 @group_app.route("/video_feed")
 def video_feed():
     return Response(gen_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# ==========================================
+# 🦊 FOXGLOVE SLAM: лидар, трекинг человека, радар, команды роботу (всегда независимо)
+# Порт 5001, камера FOXGLOVE_CAMERA_INDEX (1 по умолчанию, чтобы не конфликтовать с Group ID на 0)
+# ==========================================
+FOXGLOVE_CAMERA_FOV = 60
+FOXGLOVE_MAX_RADAR_DIST_MM = 4000
+FOXGLOVE_ARDUINO_URL = "http://192.168.4.1"
+FOXGLOVE_CAMERA_INDEX = 1  # попытка 1, затем 0 (Group ID использует 0)
+FOXGLOVE_PORT = 5001
+
+foxglove_app = Flask("foxglove_slam")
+foxglove_current_frame = None
+foxglove_latest_scan = [0] * 360
+foxglove_robot_command = "S"
+
+def foxglove_send_command(cmd):
+    global foxglove_robot_command
+    if cmd != foxglove_robot_command:
+        try:
+            requests.get(f"{FOXGLOVE_ARDUINO_URL}/{cmd}", timeout=0.1)
+            foxglove_robot_command = cmd
+            print(f"🤖 FOXGLOVE ВІДПРАВЛЕНО: {cmd}")
+        except Exception:
+            pass
+
+def foxglove_create_tracker():
+    try:
+        return cv2.TrackerKCF_create()
+    except AttributeError:
+        try:
+            return cv2.legacy.TrackerKCF_create()
+        except Exception:
+            return cv2.TrackerMIL_create()
+
+def foxglove_get_robust_distance(scan, target_angle, window_size=5):
+    valid_dists = []
+    for i in range(-window_size, window_size + 1):
+        angle = int(target_angle + i) % 360
+        dist = scan[angle]
+        if 50 < dist < 8000:
+            valid_dists.append(dist)
+    if not valid_dists:
+        return None
+    valid_dists.sort()
+    return valid_dists[len(valid_dists) // 2]
+
+def foxglove_draw_radar_map(scan, target_angle=None, target_dist=None):
+    size = 400
+    center = (size // 2, size // 2)
+    scale = (size / 2) / FOXGLOVE_MAX_RADAR_DIST_MM
+    radar_img = np.zeros((size, size, 3), dtype=np.uint8)
+    for r in [1000, 2000, 3000, 4000]:
+        r_px = int(r * scale)
+        cv2.circle(radar_img, center, r_px, (40, 40, 40), 1)
+    fov_half = FOXGLOVE_CAMERA_FOV / 2.0
+    cv2.ellipse(radar_img, center, (int(FOXGLOVE_MAX_RADAR_DIST_MM*scale), int(FOXGLOVE_MAX_RADAR_DIST_MM*scale)),
+                -90, -fov_half, fov_half, (20, 20, 60), -1)
+    cv2.line(radar_img, center, (center[0], 0), (0, 255, 0), 2)
+    for angle in range(360):
+        dist = scan[angle]
+        if 50 < dist < FOXGLOVE_MAX_RADAR_DIST_MM:
+            rad = math.radians(angle - 90)
+            x = int(center[0] + dist * scale * math.cos(rad))
+            y = int(center[1] + dist * scale * math.sin(rad))
+            cv2.circle(radar_img, (x, y), 2, (255, 255, 255), -1)
+    if target_angle is not None and target_dist is not None and target_dist > 0:
+        rad = math.radians(target_angle - 90)
+        x = int(center[0] + target_dist * scale * math.cos(rad))
+        y = int(center[1] + target_dist * scale * math.sin(rad))
+        cv2.line(radar_img, center, (x, y), (0, 0, 255), 1)
+        cv2.circle(radar_img, (x, y), 6, (0, 0, 255), -1)
+    cv2.circle(radar_img, center, 8, (0, 255, 255), -1)
+    return radar_img
+
+def foxglove_lidar_thread():
+    global foxglove_latest_scan
+    if serial is None:
+        return
+    PORT_NAME = "/dev/ttyACM0"
+    BAUDRATE = 230400
+    try:
+        lidar_serial = serial.Serial(PORT_NAME, BAUDRATE, timeout=1)
+    except Exception:
+        return
+    scan_data = [0] * 360
+    last_angle = 0.0
+    buffer = bytearray()
+    while True:
+        try:
+            if lidar_serial.in_waiting > 0:
+                buffer.extend(lidar_serial.read(lidar_serial.in_waiting))
+            else:
+                buffer.extend(lidar_serial.read(1))
+            while len(buffer) >= 47:
+                if buffer[0] == 0x54 and buffer[1] == 0x2C:
+                    packet = buffer[:47]
+                    del buffer[:47]
+                    start_angle = (packet[4] + packet[5] * 256) / 100.0
+                    end_angle = (packet[42] + packet[43] * 256) / 100.0
+                    if start_angle > 360.0 or end_angle > 360.0:
+                        continue
+                    step = (end_angle - start_angle)
+                    if step < 0:
+                        step += 360.0
+                    step /= 11.0
+                    if start_angle < last_angle - 180:
+                        foxglove_latest_scan = scan_data.copy()
+                        scan_data = [0] * 360
+                    for i in range(12):
+                        distance = packet[6 + i*3] + packet[7 + i*3] * 256
+                        if 50 < distance < 8000:
+                            scan_data[int((start_angle + i * step) + 0.5) % 360] = distance
+                    last_angle = start_angle
+                else:
+                    del buffer[0:1]
+        except Exception:
+            time.sleep(0.01)
+
+def foxglove_camera_thread():
+    global foxglove_current_frame, foxglove_latest_scan, foxglove_robot_command
+    mp_pose_fox = mp.solutions.pose
+    pose_fox = mp_pose_fox.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    cap = cv2.VideoCapture(FOXGLOVE_CAMERA_INDEX)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(0)
+    cap.set(3, 320)
+    cap.set(4, 240)
+    tracking_active = False
+    tracker = None
+    lock_counter = 0
+    smoothed_human_distance = None
+    while cap.isOpened():
+        success, image = cap.read()
+        if not success:
+            continue
+        h, w = image.shape[:2]
+        target_angle = None
+        human_distance = None
+        angle_offset = 0
+        cmd = "S"
+        cv2.line(image, (w//2, 0), (w//2, h), (255, 255, 255), 1)
+        x_m15 = int(w/2 - (15.0 / FOXGLOVE_CAMERA_FOV) * w)
+        x_p15 = int(w/2 + (15.0 / FOXGLOVE_CAMERA_FOV) * w)
+        cv2.line(image, (x_m15, 0), (x_m15, h), (100, 255, 100), 1)
+        cv2.line(image, (x_p15, 0), (x_p15, h), (100, 255, 100), 1)
+        cv2.putText(image, "0", (w//2 + 5, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.putText(image, "-15", (x_m15 - 25, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 255, 100), 1)
+        cv2.putText(image, "+15", (x_p15 + 5, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 255, 100), 1)
+        if not tracking_active:
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            results = pose_fox.process(image_rgb)
+            if results.pose_landmarks:
+                lm = results.pose_landmarks.landmark
+                pts = [lm[11], lm[12], lm[23], lm[24]]
+                xs, ys = [p.x * w for p in pts], [p.y * h for p in pts]
+                x_min, x_max = int(min(xs)), int(max(xs))
+                y_min, y_max = int(min(ys)), int(max(ys))
+                pad_x, pad_y = int((x_max - x_min) * 0.2), int((y_max - y_min) * 0.2)
+                bx, by = max(0, x_min - pad_x), max(0, y_min - pad_y)
+                bw, bh = min(w, x_max - x_min + 2*pad_x), min(h, y_max - y_min + 2*pad_y)
+                center_x = bx + bw/2.0
+                angle_offset = (center_x / w - 0.5) * FOXGLOVE_CAMERA_FOV
+                target_angle = int(angle_offset) % 360
+                raw_dist = foxglove_get_robust_distance(foxglove_latest_scan, target_angle, window_size=5)
+                if raw_dist is not None:
+                    if smoothed_human_distance is None:
+                        smoothed_human_distance = raw_dist
+                    else:
+                        smoothed_human_distance = int(0.2 * raw_dist + 0.8 * smoothed_human_distance)
+                human_distance = smoothed_human_distance if smoothed_human_distance else 0
+                cv2.rectangle(image, (bx, by), (bx+bw, by+bh), (0, 255, 255), 2)
+                label = f"SEARCH {human_distance} mm" if (human_distance and human_distance > 0) else "SEARCHING..."
+                cv2.putText(image, label, (bx, by-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                if -10 <= angle_offset <= 10 and 400 < human_distance < 2000:
+                    lock_counter += 1
+                    cv2.circle(image, (w//2, h//2), lock_counter*2, (0, 255, 255), 2)
+                    if lock_counter > 20:
+                        tracker = foxglove_create_tracker()
+                        tracker.init(image, (bx, by, bw, bh))
+                        tracking_active = True
+                else:
+                    lock_counter = 0
+            else:
+                smoothed_human_distance = None
+        else:
+            ok, bbox = tracker.update(image)
+            if ok:
+                bx, by, bw, bh = [int(v) for v in bbox]
+                center_x = bx + bw/2.0
+                angle_offset = (center_x / w - 0.5) * FOXGLOVE_CAMERA_FOV
+                target_angle = int(angle_offset) % 360
+                raw_dist = foxglove_get_robust_distance(foxglove_latest_scan, target_angle, window_size=5)
+                if raw_dist is not None:
+                    if smoothed_human_distance is None:
+                        smoothed_human_distance = raw_dist
+                    else:
+                        smoothed_human_distance = int(0.2 * raw_dist + 0.8 * smoothed_human_distance)
+                human_distance = smoothed_human_distance if smoothed_human_distance else 0
+                cv2.rectangle(image, (bx, by), (bx+bw, by+bh), (0, 255, 0), 3)
+                label = f"LOCKED {human_distance} mm" if (human_distance and human_distance > 0) else "LOCKED"
+                cv2.putText(image, label, (bx, by-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                if human_distance > 100:
+                    if human_distance < 600:
+                        cmd = "B"
+                    elif human_distance < 1000:
+                        cmd = "S"
+                    else:
+                        if angle_offset < -15:
+                            cmd = "L"
+                        elif angle_offset > 15:
+                            cmd = "R"
+                        else:
+                            cmd = "F"
+            else:
+                tracking_active = False
+                lock_counter = 0
+                smoothed_human_distance = None
+                cmd = "S"
+                cv2.putText(image, "TARGET LOST!", (w//2-70, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        foxglove_send_command(cmd)
+        cv2.putText(image, f"Angle: {int(angle_offset)} deg", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        dist_text = f"Dist: {human_distance} mm" if human_distance else "Dist: LOST"
+        cv2.putText(image, dist_text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        cv2.putText(image, f"CMD: {foxglove_robot_command}", (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        new_w = int(w * (400 / h))
+        cam_resized = cv2.resize(image, (new_w, 400))
+        radar_img = foxglove_draw_radar_map(foxglove_latest_scan, target_angle, human_distance)
+        combined_img = np.hstack((cam_resized, radar_img))
+        ret, buffer = cv2.imencode(".jpg", combined_img)
+        if ret:
+            foxglove_current_frame = buffer.tobytes()
+
+def foxglove_generate_frames():
+    global foxglove_current_frame
+    while True:
+        if foxglove_current_frame is not None:
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + foxglove_current_frame + b"\r\n")
+        else:
+            time.sleep(0.05)
+
+@foxglove_app.route("/")
+def foxglove_index():
+    return """<!DOCTYPE html><html><head><title>Robot Follow (Foxglove)</title></head>
+    <body style="background:#111; text-align:center; color:white; font-family:sans-serif;">
+        <h3>Зліва: Camera Tracker (HUD) &nbsp;|&nbsp; Справа: 2D Радар</h3>
+        <img src="/video_feed" style="max-width: 100%; border: 3px solid #00ffcc; border-radius: 5px;">
+    </body></html>"""
+
+@foxglove_app.route("/video_feed")
+def foxglove_video_feed():
+    return Response(foxglove_generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+def run_foxglove_flask():
+    foxglove_app.run(host="0.0.0.0", port=FOXGLOVE_PORT, debug=False, use_reloader=False)
 
 # Import existing functionality from chat.py
 def init_embeddings_db(folder: Path) -> str:
@@ -995,6 +1256,12 @@ tools = [
 
 async def main():
     global db_path, openai_client
+
+    # Foxglove SLAM: лидар + камера + радар + команды роботу — всегда и независимо от остального
+    threading.Thread(target=foxglove_lidar_thread, daemon=True).start()
+    threading.Thread(target=foxglove_camera_thread, daemon=True).start()
+    threading.Thread(target=run_foxglove_flask, daemon=True).start()
+    print(f"Foxglove SLAM: http://0.0.0.0:{FOXGLOVE_PORT}/ (camera + radar, robot commands)")
 
     # Robustly load .env (search parent folders) and validate API key
     dotenv_path = find_dotenv() or ""
