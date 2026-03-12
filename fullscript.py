@@ -1441,54 +1441,72 @@ async def main():
         tools=tools,
     )
 
+    # Флаг: удалось ли подключиться к Realtime API
+    realtime_connected = False
+
     try:
         try:
             await realtime_client.connect()
+            realtime_connected = True
         except Exception as conn_err:
-            # WebSocket/connection error — print details and re-raise
+            # WebSocket/connection error — печатаем детали, НО не падаем
             import traceback
             print("Failed to connect to Realtime API:")
             print(repr(conn_err))
             print(traceback.format_exc())
 
-            # Try to detect common causes
-            # e.g., websockets.exceptions.InvalidStatusCode has .status_code
+            # Попробуем вывести код статуса, если он есть
             status = None
-            if hasattr(conn_err, 'status_code'):
-                status = getattr(conn_err, 'status_code')
-            elif hasattr(conn_err, 'response') and hasattr(conn_err.response, 'status_code'):
+            if hasattr(conn_err, "status_code"):
+                status = getattr(conn_err, "status_code")
+            elif hasattr(conn_err, "response") and hasattr(conn_err.response, "status_code"):
                 status = conn_err.response.status_code
 
             if status:
                 print(f"Server returned status code: {status}")
                 if status >= 500:
                     print("Server error (5xx) — may be temporary. Try again later or check service status.")
-            # Also print the sanitized API key prefix to confirm which key was used
+
             print(f"OPENAI_API_KEY preview: {masked}")
-            raise
+            print("Realtime API is unavailable. Continuing without voice assistant.")
+        else:
+            # Подключение удалось — запускаем обработку сообщений и аудио
+            message_handler = asyncio.create_task(realtime_client.handle_messages())
 
-        message_handler = asyncio.create_task(realtime_client.handle_messages())
+            print("Connected to OpenAI Realtime API!")
+            print("Audio streaming will start automatically.")
+            print("Use Ctrl+C or your service manager to stop the app.")
+            print("")
 
-        print("Connected to OpenAI Realtime API!")
-        print("Audio streaming will start automatically.")
-        print("Use Ctrl+C or your service manager to stop the app.")
-        print("")
+            # Start continuous audio streaming
+            streaming_task = asyncio.create_task(audio_handler.start_streaming(realtime_client))
 
-        # Start continuous audio streaming
-        streaming_task = asyncio.create_task(audio_handler.start_streaming(realtime_client))
-
-        # Run until one of the tasks finishes or the process is interrupted
-        await asyncio.gather(message_handler, streaming_task)
+            # Run until one of the tasks finishes or the process is interrupted
+            await asyncio.gather(message_handler, streaming_task)
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error in Realtime loop: {e}")
     finally:
-        # Save conversation on exit
-        conversation_manager.save_conversation()
+        # Пытаемся аккуратно завершить Realtime‑клиент (если он вообще инициализировался)
+        try:
+            conversation_manager.save_conversation()
+        except Exception as save_err:
+            print(f"Error while saving conversation: {save_err}")
 
-        audio_handler.stop_streaming()
-        audio_handler.cleanup()
-        await realtime_client.close()
+        try:
+            audio_handler.stop_streaming()
+            audio_handler.cleanup()
+        except Exception as audio_err:
+            print(f"Error while cleaning up audio handler: {audio_err}")
+
+        try:
+            await realtime_client.close()
+        except Exception as close_err:
+            print(f"Error while closing realtime client: {close_err}")
+
+    # ВАЖНО: не выходим из main(), чтобы фонові потоки (Group ID, Foxglove) жили всегда
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     print("Starting Realtime API CLI with Knowledge Base...")
