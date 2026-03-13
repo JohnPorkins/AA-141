@@ -6,6 +6,8 @@ import sqlite3
 import math
 import time
 import threading
+import platform
+import glob
 from array import array
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +20,7 @@ from llama_index.core.tools import FunctionTool
 
 import numpy as np
 import cv2
-from flask import Flask, Response
+from flask import Flask, Response, request
 import requests
 
 try:
@@ -53,6 +55,35 @@ NN_SKIP_FRAMES = 15
 outputFrame = None
 frame_lock = threading.Lock()
 group_app = Flask(__name__)
+
+# Saves all unique viewers of the camera stream endpoints (/video_feed)
+# Each entry is a tuple: (ip, user_agent)
+CAMERA_CHANNEL_USERS = set()
+camera_channel_users_lock = threading.Lock()
+
+def open_camera(preferred_indexes, width=320, height=240):
+    """
+    Best-effort OpenCV camera open that is more reliable on Linux/Raspberry Pi.
+    Returns an opened cv2.VideoCapture or None.
+    """
+    is_linux = platform.system().lower() == "linux"
+    backend = cv2.CAP_V4L2 if is_linux and hasattr(cv2, "CAP_V4L2") else None
+    for idx in preferred_indexes:
+        cap = None
+        try:
+            cap = cv2.VideoCapture(idx, backend) if backend is not None else cv2.VideoCapture(idx)
+            if cap is not None and cap.isOpened():
+                cap.set(3, width)
+                cap.set(4, height)
+                return cap
+        except Exception:
+            pass
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+    return None
 
 robot_state = {
     "status": "BOOTING...",
@@ -183,13 +214,14 @@ def run_registration():
     robot_state["subtext"] = "Freeze..."
     robot_state["color"] = (255, 0, 255)
     time.sleep(1.0)
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(1)
-    cap.set(3, 320)
-    cap.set(4, 240)
+    cap = open_camera([0, 1])
+    if cap is None:
+        return
     ret, frame = cap.read()
-    cap.release()
+    try:
+        cap.release()
+    except Exception:
+        pass
     if not ret:
         return
     faces = face_app.get(frame)
@@ -252,11 +284,10 @@ def logic_loop():
                 time.sleep(1)
         elif robot_state["mode"] == "AWAKE":
             if cap is None or not cap.isOpened():
-                cap = cv2.VideoCapture(0)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(1)
-                cap.set(3, 320)
-                cap.set(4, 240)
+                cap = open_camera([0, 1])
+                if cap is None:
+                    time.sleep(0.2)
+                    continue
             ret, frame = cap.read()
             if not ret:
                 continue
@@ -310,11 +341,10 @@ def logic_loop():
                                     print(">>> Голос чужой.")
                         except Exception:
                             pass
-                        cap = cv2.VideoCapture(0)
-                        if not cap.isOpened():
-                            cap = cv2.VideoCapture(1)
-                        cap.set(3, 320)
-                        cap.set(4, 240)
+                        cap = open_camera([0, 1])
+                        if cap is None:
+                            time.sleep(0.2)
+                            continue
                     cached_people = visible_users
             if cached_people:
                 last_activity = time.time()
@@ -389,6 +419,13 @@ def gen_frames():
 
 @group_app.route("/video_feed")
 def video_feed():
+    try:
+        ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+        ua = (request.headers.get("User-Agent") or "").strip()
+        with camera_channel_users_lock:
+            CAMERA_CHANNEL_USERS.add((ip, ua))
+    except Exception:
+        pass
     return Response(gen_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 # ==========================================
@@ -469,11 +506,24 @@ def foxglove_lidar_thread():
     global foxglove_latest_scan
     if serial is None:
         return
-    PORT_NAME = "/dev/ttyACM0"
     BAUDRATE = 230400
+    port_candidates = ["/dev/ttyACM0"]
     try:
-        lidar_serial = serial.Serial(PORT_NAME, BAUDRATE, timeout=1)
+        port_candidates = sorted(set(
+            port_candidates
+            + glob.glob("/dev/ttyACM*")
+            + glob.glob("/dev/ttyUSB*")
+        ))
     except Exception:
+        pass
+    lidar_serial = None
+    for port in port_candidates:
+        try:
+            lidar_serial = serial.Serial(port, BAUDRATE, timeout=1)
+            break
+        except Exception:
+            lidar_serial = None
+    if lidar_serial is None:
         return
     scan_data = [0] * 360
     last_angle = 0.0
@@ -513,11 +563,9 @@ def foxglove_camera_thread():
     global foxglove_current_frame, foxglove_latest_scan, foxglove_robot_command
     mp_pose_fox = mp.solutions.pose
     pose_fox = mp_pose_fox.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-    cap = cv2.VideoCapture(FOXGLOVE_CAMERA_INDEX)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(0)
-    cap.set(3, 320)
-    cap.set(4, 240)
+    cap = open_camera([FOXGLOVE_CAMERA_INDEX, 0, 1])
+    if cap is None:
+        return
     tracking_active = False
     tracker = None
     lock_counter = 0
@@ -641,6 +689,13 @@ def foxglove_index():
 
 @foxglove_app.route("/video_feed")
 def foxglove_video_feed():
+    try:
+        ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+        ua = (request.headers.get("User-Agent") or "").strip()
+        with camera_channel_users_lock:
+            CAMERA_CHANNEL_USERS.add((ip, ua))
+    except Exception:
+        pass
     return Response(foxglove_generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 def run_foxglove_flask():
