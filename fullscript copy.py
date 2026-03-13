@@ -163,8 +163,8 @@ def init_group_models():
     speaker_model = None
     speaker_sources = [
         # common SpeechBrain repos (try in order)
-        "speechbrain/spkrec-xvect-voxceleb",
         "speechbrain/spkrec-ecapa-voxceleb",
+        "speechbrain/spkrec-xvect-voxceleb",
     ]
     # First try local cache dir if it exists (avoids network)
     try:
@@ -186,14 +186,8 @@ def init_group_models():
     if speaker_model is None:
         print(f">>> [INIT] Speaker model unavailable (voice-ID disabled): {last_err}")
     face_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
-    face_app.prepare(ctx_id=-1, det_size=(224, 224))
-    # Using model_complexity=0 for lighter CPU load
-    hands_detector = mp.solutions.hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.5,
-        model_complexity=0
-    )
+    face_app.prepare(ctx_id=-1, det_size=(320, 320))
+    hands_detector = mp.solutions.hands.Hands(max_num_hands=1, min_detection_confidence=0.5)
     _group_models_loaded = True
     print(">>> [INIT] Group ID модели загружены.")
 
@@ -234,7 +228,7 @@ def is_silence(audio_chunk):
     # First do a simple energy gate; if there's any non-trivial level, treat as non-silence.
     try:
         level = float(np.max(np.abs(audio_chunk)))
-        if not math.isnan(level) and level > 5e-4: # Tightened gate
+        if not math.isnan(level) and level > 1e-5:
             return False
     except Exception:
         # If anything goes wrong, fall back to VAD below.
@@ -284,23 +278,21 @@ def find_speaker_in_group(voice_emb, visible_users):
 def is_waving(frame):
     """Проверяет, машет ли человек любой рукой (левой или правой)"""
     try:
-        # Check if frame is already RGB to avoid conversion
-        # However, OpenCV usually gives BGR. If frame is from unified_vision_worker, it is BGR.
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = hands_detector.process(rgb)
         if res.multi_hand_landmarks:
-            # Check all detected hands
+            # Проверяем все обнаруженные руки
             for hand_landmarks in res.multi_hand_landmarks:
                 lms = hand_landmarks.landmark
-                # Check waving: index finger tip above wrist
+                # Проверяем махание: кончик указательного пальца выше запястья
                 if lms[8].y < lms[0].y:
-                    return True, res # Return results to avoid re-running model for drawing
+                    return True
     except Exception:
         pass
     finally:
         # Give a tiny break back to other threads
-        time.sleep(0.005) # Reduced sleep
-    return False, None
+        time.sleep(0.01)
+    return False
 
 def run_registration():
     global robot_state
@@ -494,6 +486,7 @@ def foxglove_lidar_thread():
                 buffer.extend(lidar_serial.read(lidar_serial.in_waiting))
             else:
                 buffer.extend(lidar_serial.read(1))
+            print(buffer)
             while len(buffer) >= 47:
                 if buffer[0] == 0x54 and buffer[1] == 0x2C:
                     packet = buffer[:47]
@@ -532,19 +525,13 @@ def unified_vision_worker():
 
     # Init Foxglove components
     mp_pose_fox = mp.solutions.pose
-    # Using model_complexity=0 for lighter CPU load
-    pose_fox = mp_pose_fox.Pose(
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-        model_complexity=0
-    )
+    pose_fox = mp_pose_fox.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
     tracking_active = False
     lock_counter = 0
     smoothed_human_distance = None
     tracker = None
     
     frame_counter = 0
-    pose_search_counter = 0
     cached_people = []
 
     while True:
@@ -574,8 +561,7 @@ def unified_vision_worker():
                 faces = face_app.get(frame)
                 cached_people = []
                 if faces:
-                    waving, hand_res = is_waving(frame)
-                    if waving:
+                    if is_waving(frame):
                         run_registration()
                     else:
                         for face in faces:
@@ -611,11 +597,14 @@ def unified_vision_worker():
         else:
             robot_state["status"], robot_state["subtext"] = "SEARCHING", "..."
 
-        # MediaPipe Hands Drawing (only if we recently processed hands for waving)
+        # MediaPipe Hands (always)
         try:
-            if hands_detector and 'hand_res' in locals() and hand_res and hand_res.multi_hand_landmarks:
-                for hlms in hand_res.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(group_frame, hlms, mp.solutions.hands.HAND_CONNECTIONS)
+            if hands_detector:
+                rgb_h = cv2.cvtColor(group_frame, cv2.COLOR_BGR2RGB)
+                res_h = hands_detector.process(rgb_h)
+                if res_h.multi_hand_landmarks:
+                    for hlms in res_h.multi_hand_landmarks:
+                        mp_drawing.draw_landmarks(group_frame, hlms, mp.solutions.hands.HAND_CONNECTIONS)
         except Exception: pass
 
         cv2.rectangle(group_frame, (0, 0), (320, 30), (0, 0, 0), -1)
@@ -640,28 +629,25 @@ def unified_vision_worker():
         cv2.line(fox_image, (x_p15, 0), (x_p15, h), (100, 255, 100), 1)
 
         if not tracking_active:
-            # Skip frames during person search to save CPU
-            pose_search_counter += 1
-            if pose_search_counter % 5 == 0:
-                res_p = pose_fox.process(cv2.cvtColor(fox_image, cv2.COLOR_BGR2RGB))
-                if res_p.pose_landmarks:
-                    lm = res_p.pose_landmarks.landmark
-                    pts = [lm[11], lm[12], lm[23], lm[24]]
-                    xs, ys = [p.x * w for p in pts], [p.y * h for p in pts]
-                    xb, yb, wb, hb = int(min(xs)), int(min(ys)), int(max(xs)-min(xs)), int(max(ys)-min(ys))
-                    angle_offset = ( (xb+wb/2.0) / w - 0.5) * FOXGLOVE_CAMERA_FOV
-                    target_angle = int(angle_offset) % 360
-                    raw_dist = foxglove_get_robust_distance(foxglove_latest_scan, target_angle)
-                    if raw_dist: smoothed_human_distance = raw_dist if smoothed_human_distance is None else int(0.2*raw_dist + 0.8*smoothed_human_distance)
-                    human_distance = smoothed_human_distance or 0
-                    cv2.rectangle(fox_image, (xb, yb), (xb+wb, yb+hb), (0, 255, 255), 2)
-                    if -10 <= angle_offset <= 10 and 400 < human_distance < 2000:
-                        lock_counter += 1
-                        if lock_counter > 15:
-                            tracker = foxglove_create_tracker()
-                            tracker.init(frame, (max(0,xb), max(0,yb), min(w-xb,wb), min(h-yb,hb)))
-                            tracking_active = True
-                    else: lock_counter = 0
+            res_p = pose_fox.process(cv2.cvtColor(fox_image, cv2.COLOR_BGR2RGB))
+            if res_p.pose_landmarks:
+                lm = res_p.pose_landmarks.landmark
+                pts = [lm[11], lm[12], lm[23], lm[24]]
+                xs, ys = [p.x * w for p in pts], [p.y * h for p in pts]
+                xb, yb, wb, hb = int(min(xs)), int(min(ys)), int(max(xs)-min(xs)), int(max(ys)-min(ys))
+                angle_offset = ( (xb+wb/2.0) / w - 0.5) * FOXGLOVE_CAMERA_FOV
+                target_angle = int(angle_offset) % 360
+                raw_dist = foxglove_get_robust_distance(foxglove_latest_scan, target_angle)
+                if raw_dist: smoothed_human_distance = raw_dist if smoothed_human_distance is None else int(0.2*raw_dist + 0.8*smoothed_human_distance)
+                human_distance = smoothed_human_distance or 0
+                cv2.rectangle(fox_image, (xb, yb), (xb+wb, yb+hb), (0, 255, 255), 2)
+                if -10 <= angle_offset <= 10 and 400 < human_distance < 2000:
+                    lock_counter += 1
+                    if lock_counter > 15:
+                        tracker = foxglove_create_tracker()
+                        tracker.init(frame, (max(0,xb), max(0,yb), min(w-xb,wb), min(h-yb,hb)))
+                        tracking_active = True
+                else: lock_counter = 0
         else:
             ok, bbox = tracker.update(frame)
             if ok:
@@ -717,6 +703,8 @@ def foxglove_video_feed():
     except Exception:
         pass
     return Response(foxglove_generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# Removed run_foxglove_flask to consolidate apps
 
 # Import existing functionality from chat.py
 def init_embeddings_db(folder: Path) -> str:

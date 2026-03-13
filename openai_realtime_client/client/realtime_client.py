@@ -249,12 +249,14 @@ class RealtimeClient:
         }
         await self.ws.send(json.dumps(event))
     
-    async def truncate_response(self):
+    async def truncate_response(self, content_index: int = 0, audio_end_ms: int = 0):
         """Truncate the conversation item to match what was actually played."""
         if self._current_item_id:
             event = {
                 "type": "conversation.item.truncate",
-                "item_id": self._current_item_id
+                "item_id": self._current_item_id,
+                "content_index": content_index,
+                "audio_end_ms": audio_end_ms
             }
             await self.ws.send(json.dumps(event))
 
@@ -288,7 +290,7 @@ class RealtimeClient:
         
         # 2. Truncate the conversation item to what was actually played
         if self._current_item_id:
-            await self.truncate_response()
+            await self.truncate_response(content_index=0)
             
         self._is_responding = False
         self._current_response_id = None
@@ -301,7 +303,12 @@ class RealtimeClient:
                 event_type = event.get("type")
                 
                 if event_type == "error":
-                    print(f"Error: {event['error']}")
+                    error_data = event.get("error", {})
+                    error_code = error_data.get("code")
+                    # Suppress "response_cancel_not_active" which is common during interruptions
+                    if error_code == "response_cancel_not_active":
+                        continue
+                    print(f"Error: {error_data}")
                     continue
                 
                 # Track response state
@@ -372,6 +379,9 @@ class RealtimeClient:
 
         except websockets.exceptions.ConnectionClosed:
             print("Connection closed")
+        except asyncio.CancelledError:
+            # Normal shutdown path (e.g. Ctrl+C / task cancellation)
+            return
         except Exception as e:
             print(f"Error in message handling: {str(e)}")
 

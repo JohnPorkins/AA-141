@@ -101,7 +101,7 @@ def draw_radar_map(scan, target_angle=None, target_dist=None):
 # ==========================================
 def lidar_thread():
     global latest_scan
-    PORT_NAME = '/dev/ttyACM0'
+    PORT_NAME = '/dev/ttyAMA10'
     BAUDRATE = 230400
     try: lidar_serial = serial.Serial(PORT_NAME, BAUDRATE, timeout=1)
     except: return
